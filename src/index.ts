@@ -5,8 +5,9 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
+import https from "https";
 
-const API_BASE = "https://api.sheetlink.app";
+const API_BASE = "api.sheetlink.app";
 const API_KEY = process.env.SHEETLINK_API_KEY;
 
 if (!API_KEY) {
@@ -14,22 +15,38 @@ if (!API_KEY) {
   process.exit(1);
 }
 
-async function apiFetch(path: string, options: RequestInit = {}) {
-  const res = await fetch(`${API_BASE}${path}`, {
-    ...options,
-    headers: {
-      Authorization: `Bearer ${API_KEY}`,
-      "Content-Type": "application/json",
-      ...options.headers,
-    },
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function apiFetch(path: string, options: { method?: string; body?: string } = {}): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const bodyData = options.body ?? null;
+    const reqOptions: https.RequestOptions = {
+      hostname: API_BASE,
+      path,
+      method: options.method ?? "GET",
+      headers: {
+        Authorization: `Bearer ${API_KEY}`,
+        "Content-Type": "application/json",
+        ...(bodyData ? { "Content-Length": Buffer.byteLength(bodyData) } : {}),
+      },
+    };
+
+    const req = https.request(reqOptions, (res) => {
+      let data = "";
+      res.on("data", (chunk) => { data += chunk; });
+      res.on("end", () => {
+        if (res.statusCode && res.statusCode >= 400) {
+          reject(new Error(`SheetLink API error ${res.statusCode}: ${data}`));
+        } else {
+          try { resolve(JSON.parse(data)); }
+          catch (e) { reject(new Error(`Failed to parse response: ${data}`)); }
+        }
+      });
+    });
+
+    req.on("error", reject);
+    if (bodyData) req.write(bodyData);
+    req.end();
   });
-
-  if (!res.ok) {
-    const text = await res.text();
-    throw new Error(`SheetLink API error ${res.status}: ${text}`);
-  }
-
-  return res.json();
 }
 
 // ── Tool handlers ────────────────────────────────────────────────────────────
