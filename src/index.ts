@@ -120,11 +120,13 @@ async function listTransactions(args: {
   // Filter by category
   if (args.category) {
     const cat = args.category.toUpperCase();
-    allTransactions = allTransactions.filter(
-      (t) =>
-        ((t.category_primary as string) ?? "").toUpperCase().includes(cat) ||
-        ((t.category_detailed as string) ?? "").toUpperCase().includes(cat)
-    );
+    allTransactions = allTransactions.filter((t) => {
+      const pfc = t.personal_finance_category as { primary?: string; detailed?: string } | null;
+      return (
+        (pfc?.primary ?? "").toUpperCase().includes(cat) ||
+        (pfc?.detailed ?? "").toUpperCase().includes(cat)
+      );
+    });
   }
 
   // Sort newest first
@@ -143,8 +145,9 @@ async function listTransactions(args: {
 
   const lines = transactions.map((t) => {
     const amount = typeof t.amount === "number" ? t.amount.toFixed(2) : t.amount;
-    const name = t.merchant_name ?? t.description ?? t.description_raw ?? "Unknown";
-    const cat = t.category_primary ?? "";
+    const name = t.merchant_name ?? t.description_raw ?? "Unknown";
+    const pfc = t.personal_finance_category as { primary?: string } | null;
+    const cat = pfc?.primary ?? "";
     return `${t.date}  ${String(name).padEnd(35)}  $${String(amount).padStart(8)}  ${cat}`;
   });
 
@@ -205,8 +208,8 @@ async function getSpendingSummary(args: {
   for (const t of allTransactions) {
     const key =
       groupBy === "merchant"
-        ? ((t.merchant_name ?? t.description ?? "Unknown") as string)
-        : ((t.category_primary ?? "Uncategorized") as string);
+        ? ((t.merchant_name ?? t.description_raw ?? "Unknown") as string)
+        : (((t.personal_finance_category as { primary?: string } | null)?.primary) ?? "Uncategorized");
     totals[key] = (totals[key] ?? 0) + (t.amount as number);
   }
 

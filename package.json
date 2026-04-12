@@ -1,6 +1,6 @@
 {
   "name": "@sheetlink/mcp",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "MCP server for SheetLink — connect Claude to your bank transactions",
   "type": "module",
   "main": "dist/index.js",
