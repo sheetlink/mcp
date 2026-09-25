@@ -239,6 +239,130 @@ async function getSpendingSummary(args: {
   ].join("\n");
 }
 
+// ── Investments (MAX + investment tracking enabled) ──────────────────────────
+// These call the CLI-facing /api/investments/* endpoints. Only brokerage items with investment
+// tracking enabled (chosen at connect) return data; others are skipped. A per-item 4xx (not
+// enabled / still warming / reconnect) is swallowed so one brokerage never fails the whole call.
+
+// Fetch the investment items to operate on, honoring an optional item_id filter.
+async function investmentTargets(item_id?: string): Promise<Array<{ item_id: string; institution_name: string }>> {
+  const itemsData = await apiFetch("/api/items");
+  const items = itemsData.items as Array<{ item_id: string; institution_name: string }>;
+  return item_id ? items.filter((i) => i.item_id === item_id) : items;
+}
+
+// Try to pull holdings for one item; return [] on any per-item gate/error (never throws).
+async function tryHoldings(item_id: string): Promise<Array<Record<string, unknown>>> {
+  try {
+    const data = await apiFetch("/api/investments/holdings", {
+      method: "POST",
+      body: JSON.stringify({ item_id }),
+    });
+    return (data.holdings ?? []) as Array<Record<string, unknown>>;
+  } catch {
+    return []; // not enabled / warming / reconnect / no brokerage -> skip this item
+  }
+}
+
+async function tryActivity(item_id: string): Promise<Array<Record<string, unknown>>> {
+  try {
+    const data = await apiFetch("/api/investments/transactions", {
+      method: "POST",
+      body: JSON.stringify({ item_id }),
+    });
+    return (data.investment_transactions ?? []) as Array<Record<string, unknown>>;
+  } catch {
+    return [];
+  }
+}
+
+async function listInvestmentHoldings(args: { item_id?: string }) {
+  const targets = await investmentTargets(args.item_id);
+  if (!targets.length) return "No connected accounts found.";
+
+  const rows: Array<Record<string, unknown>> = [];
+  for (const item of targets) rows.push(...(await tryHoldings(item.item_id)));
+
+  if (!rows.length) {
+    return "No investment holdings found. Connect a brokerage and choose \"Investment account\" (SheetLink MAX), then sync.";
+  }
+
+  const lines = rows.map((h) => {
+    const ticker = String(h.ticker_symbol ?? "").padEnd(8);
+    const name = String(h.security_name ?? "Unknown").slice(0, 28).padEnd(28);
+    const qty = h.quantity != null ? Number(h.quantity).toString() : "";
+    const val = h.institution_value != null ? `$${Number(h.institution_value).toFixed(2)}` : "";
+    return `${ticker}  ${name}  qty ${qty.padStart(10)}  ${val.padStart(12)}`;
+  });
+  const header = `${"Ticker".padEnd(8)}  ${"Security".padEnd(28)}  ${"Quantity".padStart(14)}  ${"Value".padStart(12)}`;
+  return [header, "─".repeat(header.length), ...lines].join("\n");
+}
+
+async function listInvestmentActivity(args: { item_id?: string; start_date?: string; end_date?: string; limit?: number }) {
+  const targets = await investmentTargets(args.item_id);
+  if (!targets.length) return "No connected accounts found.";
+
+  let rows: Array<Record<string, unknown>> = [];
+  for (const item of targets) rows.push(...(await tryActivity(item.item_id)));
+
+  if (args.start_date) rows = rows.filter((t) => (t.date as string) >= args.start_date!);
+  if (args.end_date) rows = rows.filter((t) => (t.date as string) <= args.end_date!);
+  rows.sort((a, b) => String(b.date).localeCompare(String(a.date)));
+
+  const limit = args.limit ?? 100;
+  const truncated = rows.length > limit;
+  const shown = rows.slice(0, limit);
+
+  if (!shown.length) {
+    return "No investment activity found. Enable investment tracking on a brokerage (SheetLink MAX) and sync.";
+  }
+
+  const lines = shown.map((t) => {
+    const type = String(t.type ?? "").padEnd(10);
+    const name = String(t.name ?? t.ticker_symbol ?? "").slice(0, 30).padEnd(30);
+    const qty = t.quantity != null ? Number(t.quantity).toString() : "";
+    const amt = t.amount != null ? `$${Number(t.amount).toFixed(2)}` : "";
+    return `${t.date}  ${type}  ${name}  ${qty.padStart(8)}  ${amt.padStart(12)}`;
+  });
+  const header = `${"Date".padEnd(10)}  ${"Type".padEnd(10)}  ${"Description".padEnd(30)}  ${"Qty".padStart(8)}  ${"Amount".padStart(12)}`;
+  const result = [header, "─".repeat(header.length), ...lines].join("\n");
+  return truncated ? `${result}\n\n(Showing first ${limit} of ${rows.length}. Narrow the date range or raise limit.)` : result;
+}
+
+async function getPortfolioSummary(args: { item_id?: string; group_by?: "sector" | "security" }) {
+  const targets = await investmentTargets(args.item_id);
+  if (!targets.length) return "No connected accounts found.";
+
+  const holdings: Array<Record<string, unknown>> = [];
+  for (const item of targets) holdings.push(...(await tryHoldings(item.item_id)));
+
+  if (!holdings.length) {
+    return "No investment holdings found. Connect a brokerage with investment tracking (SheetLink MAX) and sync.";
+  }
+
+  const totalValue = holdings.reduce((sum, h) => sum + (Number(h.institution_value) || 0), 0);
+  const groupBy = args.group_by ?? "sector";
+  const totals: Record<string, number> = {};
+  for (const h of holdings) {
+    const key = groupBy === "security"
+      ? (String(h.ticker_symbol ?? h.security_name ?? "Unknown"))
+      : (String(h.sector ?? "Uncategorized"));
+    totals[key] = (totals[key] ?? 0) + (Number(h.institution_value) || 0);
+  }
+  const sorted = Object.entries(totals).sort((a, b) => b[1] - a[1]);
+
+  const lines = sorted.map(([key, amt]) => {
+    const pct = totalValue > 0 ? ((amt / totalValue) * 100).toFixed(1) : "0.0";
+    return `${key.slice(0, 34).padEnd(34)}  $${amt.toFixed(2).padStart(12)}  ${pct.padStart(5)}%`;
+  });
+  return [
+    `Portfolio summary by ${groupBy}`,
+    `Total value: $${totalValue.toFixed(2)}  (${holdings.length} positions)`,
+    "─".repeat(56),
+    ...lines,
+  ].join("\n");
+}
+
 // ── MCP Server ───────────────────────────────────────────────────────────────
 
 const server = new Server(
@@ -320,6 +444,59 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: [],
       },
     },
+    {
+      name: "list_investment_holdings",
+      description:
+        "List current investment holdings (positions) across connected brokerages: ticker, security name, quantity, and current value. Requires SheetLink MAX and a brokerage connected as an investment account.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          item_id: {
+            type: "string",
+            description: "Limit to a specific brokerage (item_id from list_accounts). Omit for all.",
+          },
+        },
+        required: [],
+      },
+    },
+    {
+      name: "list_investment_activity",
+      description:
+        "List investment activity (buys, sells, dividends, interest, fees) across brokerages, optionally filtered by date range. Requires SheetLink MAX and investment tracking enabled.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          item_id: {
+            type: "string",
+            description: "Limit to a specific brokerage. Omit for all.",
+          },
+          start_date: { type: "string", description: "Start date in YYYY-MM-DD format (inclusive)." },
+          end_date: { type: "string", description: "End date in YYYY-MM-DD format (inclusive)." },
+          limit: { type: "number", description: "Max rows to return (default: 100)." },
+        },
+        required: [],
+      },
+    },
+    {
+      name: "get_portfolio_summary",
+      description:
+        "Summarize the investment portfolio: total value and allocation grouped by sector (default) or individual security, with each group's percentage of the portfolio. Useful for 'what's my allocation?' or 'what are my largest positions?'. Requires SheetLink MAX.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          item_id: {
+            type: "string",
+            description: "Limit to a specific brokerage. Omit for all.",
+          },
+          group_by: {
+            type: "string",
+            enum: ["sector", "security"],
+            description: "Group allocation by sector (default) or individual security.",
+          },
+        },
+        required: [],
+      },
+    },
   ],
 }));
 
@@ -335,6 +512,12 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
       result = await listTransactions(args as Parameters<typeof listTransactions>[0]);
     } else if (name === "get_spending_summary") {
       result = await getSpendingSummary(args as Parameters<typeof getSpendingSummary>[0]);
+    } else if (name === "list_investment_holdings") {
+      result = await listInvestmentHoldings(args as Parameters<typeof listInvestmentHoldings>[0]);
+    } else if (name === "list_investment_activity") {
+      result = await listInvestmentActivity(args as Parameters<typeof listInvestmentActivity>[0]);
+    } else if (name === "get_portfolio_summary") {
+      result = await getPortfolioSummary(args as Parameters<typeof getPortfolioSummary>[0]);
     } else {
       throw new Error(`Unknown tool: ${name}`);
     }

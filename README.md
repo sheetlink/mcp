@@ -4,11 +4,17 @@ Connect Claude to your bank transactions via SheetLink.
 
 ## What it does
 
-Exposes three tools to Claude:
+Exposes these tools to Claude:
 
+**Banking**
 - **`list_accounts`** — lists your connected bank accounts
 - **`list_transactions`** — fetches transactions with optional date, account, and category filters
 - **`get_spending_summary`** — aggregates spending by category or merchant for a date range
+
+**Investments** (brokerages connected as investment accounts)
+- **`list_investment_holdings`** — current positions: ticker, security, quantity, value
+- **`list_investment_activity`** — buys, sells, dividends, interest, and fees, with optional date range
+- **`get_portfolio_summary`** — total value and allocation by sector or security, with percentages
 
 ## Requirements
 
