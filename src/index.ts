@@ -53,26 +53,20 @@ function apiFetch(path: string, options: { method?: string; body?: string } = {}
 
 async function listAccounts() {
   const data = await apiFetch("/api/items");
-  const items = data.items as Array<{
-    item_id: string;
-    institution_name: string;
-    last_synced_at: string | null;
-  }>;
+  const items = (data.items ?? []) as Array<Record<string, unknown>>;
 
   if (!items.length) {
     return "No bank accounts connected. Visit sheetlink.app to connect a bank.";
   }
 
-  return items
-    .map(
-      (item) =>
-        `• ${item.institution_name} (item_id: ${item.item_id}, last synced: ${item.last_synced_at ?? "never"})`
-    )
-    .join("\n");
+  // Full-column JSON: every field /api/items returns per connection, including the nested accounts
+  // list (account_id, name, mask, type, subtype, balances), nicknames, and the sync exclude set.
+  return JSON.stringify({ count: items.length, items }, null, 2);
 }
 
 async function listTransactions(args: {
   item_id?: string;
+  account_id?: string;
   start_date?: string;
   end_date?: string;
   category?: string;
@@ -103,6 +97,11 @@ async function listTransactions(args: {
       body: JSON.stringify({ item_id: item.item_id }),
     });
     allTransactions.push(...(syncData.transactions ?? []));
+  }
+
+  // Filter by specific account within the bank(s)
+  if (args.account_id) {
+    allTransactions = allTransactions.filter((t) => t.account_id === args.account_id);
   }
 
   // Filter by date range
@@ -143,25 +142,19 @@ async function listTransactions(args: {
     return "No transactions found matching the given filters.";
   }
 
-  const lines = transactions.map((t) => {
-    const amount = typeof t.amount === "number" ? t.amount.toFixed(2) : t.amount;
-    const name = t.merchant_name ?? t.description_raw ?? "Unknown";
-    const pfc = t.personal_finance_category as { primary?: string } | null;
-    const cat = pfc?.primary ?? "";
-    return `${t.date}  ${String(name).padEnd(35)}  $${String(amount).padStart(8)}  ${cat}`;
-  });
-
-  const header = `${"Date".padEnd(10)}  ${"Merchant".padEnd(35)}  ${"Amount".padStart(9)}  Category`;
-  const separator = "─".repeat(header.length);
-  const result = [header, separator, ...lines].join("\n");
-
-  return truncated
-    ? `${result}\n\n(Showing first ${limit} of ${allTransactions.length} transactions. Use a narrower date range or increase limit.)`
-    : result;
+  // Full-column JSON: return every transaction field the backend provides (amount, dates, merchant,
+  // category, payment channel, location, etc.) so Claude can answer any question, not just the
+  // trimmed date/merchant/amount view.
+  return JSON.stringify(
+    { count: transactions.length, total: allTransactions.length, truncated, transactions },
+    null,
+    2
+  );
 }
 
 async function getSpendingSummary(args: {
   item_id?: string;
+  account_id?: string;
   start_date?: string;
   end_date?: string;
   group_by?: "category" | "merchant";
@@ -183,6 +176,11 @@ async function getSpendingSummary(args: {
       body: JSON.stringify({ item_id: item.item_id }),
     });
     allTransactions.push(...(syncData.transactions ?? []));
+  }
+
+  // Filter by specific account
+  if (args.account_id) {
+    allTransactions = allTransactions.filter((t) => t.account_id === args.account_id);
   }
 
   // Filter by date range
@@ -276,35 +274,54 @@ async function tryActivity(item_id: string): Promise<Array<Record<string, unknow
   }
 }
 
-async function listInvestmentHoldings(args: { item_id?: string }) {
+// Full column sets, matching the Google Sheets extension + Excel add-in exactly, so Claude gets
+// every field (cost_basis, prices, sector, option data, etc.) to answer any question. Returned as
+// JSON — the right shape for an LLM to reason over, vs. a lossy ASCII table.
+const HOLDINGS_COLUMNS = [
+  "account_id", "security_id", "security_name", "ticker_symbol", "security_type", "security_subtype",
+  "cusip", "isin", "sedol", "quantity", "cost_basis", "institution_price", "institution_value",
+  "price_as_of", "price_datetime", "vested_quantity", "vested_value", "close_price", "close_price_as_of",
+  "is_cash_equivalent", "market_identifier_code", "sector", "industry", "security_update_datetime",
+  "option_contract_type", "option_expiration_date", "option_strike_price", "option_underlying_ticker",
+  "iso_currency_code", "source_institution",
+];
+const ACTIVITY_COLUMNS = [
+  "investment_transaction_id", "account_id", "security_id", "date", "name", "type", "subtype",
+  "quantity", "price", "amount", "fees", "ticker_symbol", "security_name", "iso_currency_code",
+  "cancel_transaction_id", "source_institution",
+];
+
+function project(row: Record<string, unknown>, cols: string[]): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const c of cols) out[c] = row[c] ?? null;
+  return out;
+}
+
+async function listInvestmentHoldings(args: { item_id?: string; account_id?: string }) {
   const targets = await investmentTargets(args.item_id);
   if (!targets.length) return "No connected accounts found.";
 
-  const rows: Array<Record<string, unknown>> = [];
+  let rows: Array<Record<string, unknown>> = [];
   for (const item of targets) rows.push(...(await tryHoldings(item.item_id)));
+  if (args.account_id) rows = rows.filter((h) => h.account_id === args.account_id);
 
   if (!rows.length) {
     return "No investment holdings found. Connect a brokerage and choose \"Investment account\" (SheetLink MAX), then sync.";
   }
 
-  const lines = rows.map((h) => {
-    const ticker = String(h.ticker_symbol ?? "").padEnd(8);
-    const name = String(h.security_name ?? "Unknown").slice(0, 28).padEnd(28);
-    const qty = h.quantity != null ? Number(h.quantity).toString() : "";
-    const val = h.institution_value != null ? `$${Number(h.institution_value).toFixed(2)}` : "";
-    return `${ticker}  ${name}  qty ${qty.padStart(10)}  ${val.padStart(12)}`;
-  });
-  const header = `${"Ticker".padEnd(8)}  ${"Security".padEnd(28)}  ${"Quantity".padStart(14)}  ${"Value".padStart(12)}`;
-  return [header, "─".repeat(header.length), ...lines].join("\n");
+  // Full-column JSON so cost_basis, prices, sector, option fields, etc. are all available.
+  const holdings = rows.map((h) => project(h, HOLDINGS_COLUMNS));
+  return JSON.stringify({ count: holdings.length, holdings }, null, 2);
 }
 
-async function listInvestmentActivity(args: { item_id?: string; start_date?: string; end_date?: string; limit?: number }) {
+async function listInvestmentActivity(args: { item_id?: string; account_id?: string; start_date?: string; end_date?: string; limit?: number }) {
   const targets = await investmentTargets(args.item_id);
   if (!targets.length) return "No connected accounts found.";
 
   let rows: Array<Record<string, unknown>> = [];
   for (const item of targets) rows.push(...(await tryActivity(item.item_id)));
 
+  if (args.account_id) rows = rows.filter((t) => t.account_id === args.account_id);
   if (args.start_date) rows = rows.filter((t) => (t.date as string) >= args.start_date!);
   if (args.end_date) rows = rows.filter((t) => (t.date as string) <= args.end_date!);
   rows.sort((a, b) => String(b.date).localeCompare(String(a.date)));
@@ -317,24 +334,22 @@ async function listInvestmentActivity(args: { item_id?: string; start_date?: str
     return "No investment activity found. Enable investment tracking on a brokerage (SheetLink MAX) and sync.";
   }
 
-  const lines = shown.map((t) => {
-    const type = String(t.type ?? "").padEnd(10);
-    const name = String(t.name ?? t.ticker_symbol ?? "").slice(0, 30).padEnd(30);
-    const qty = t.quantity != null ? Number(t.quantity).toString() : "";
-    const amt = t.amount != null ? `$${Number(t.amount).toFixed(2)}` : "";
-    return `${t.date}  ${type}  ${name}  ${qty.padStart(8)}  ${amt.padStart(12)}`;
-  });
-  const header = `${"Date".padEnd(10)}  ${"Type".padEnd(10)}  ${"Description".padEnd(30)}  ${"Qty".padStart(8)}  ${"Amount".padStart(12)}`;
-  const result = [header, "─".repeat(header.length), ...lines].join("\n");
-  return truncated ? `${result}\n\n(Showing first ${limit} of ${rows.length}. Narrow the date range or raise limit.)` : result;
+  // Full-column JSON (all 16 activity fields).
+  const activity = shown.map((t) => project(t, ACTIVITY_COLUMNS));
+  return JSON.stringify(
+    { count: activity.length, total: rows.length, truncated, activity },
+    null,
+    2
+  );
 }
 
-async function getPortfolioSummary(args: { item_id?: string; group_by?: "sector" | "security" }) {
+async function getPortfolioSummary(args: { item_id?: string; account_id?: string; group_by?: "sector" | "security" }) {
   const targets = await investmentTargets(args.item_id);
   if (!targets.length) return "No connected accounts found.";
 
-  const holdings: Array<Record<string, unknown>> = [];
+  let holdings: Array<Record<string, unknown>> = [];
   for (const item of targets) holdings.push(...(await tryHoldings(item.item_id)));
+  if (args.account_id) holdings = holdings.filter((h) => h.account_id === args.account_id);
 
   if (!holdings.length) {
     return "No investment holdings found. Connect a brokerage with investment tracking (SheetLink MAX) and sync.";
@@ -375,7 +390,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "list_accounts",
       description:
-        "List all bank accounts connected to SheetLink, including institution names and last sync time.",
+        "List all connected banks/brokerages as JSON with full details: item_id, institution, last sync, nicknames, and the nested per-account list (account_id, name, mask, type, subtype, balances). Use the item_id and account_id values here to filter the other tools.",
       inputSchema: {
         type: "object",
         properties: {},
@@ -385,14 +400,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "list_transactions",
       description:
-        "Fetch bank transactions from SheetLink. Optionally filter by account, date range, or spending category. Returns date, merchant, amount, and category for each transaction.",
+        "Fetch bank transactions from SheetLink as JSON with the full field set (amount, dates, merchant, category, payment channel, location, etc.). Filter by bank (item_id), specific account (account_id), date range, or category.",
       inputSchema: {
         type: "object",
         properties: {
           item_id: {
             type: "string",
             description:
-              "Filter to a specific bank account (item_id from list_accounts). Omit to fetch all accounts.",
+              "Filter to a specific bank/institution (item_id from list_accounts). Omit for all banks.",
+          },
+          account_id: {
+            type: "string",
+            description:
+              "Filter to a specific account within a bank (account_id from list_accounts' nested accounts). Omit for all accounts.",
           },
           start_date: {
             type: "string",
@@ -418,14 +438,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "get_spending_summary",
       description:
-        "Get a spending summary aggregated by category or merchant for a given date range. Useful for answering questions like 'how much did I spend on food last month?' or 'what are my top spending categories?'",
+        "Get a spending summary aggregated by category or merchant for a date range. Useful for 'how much did I spend on food last month?' or 'what are my top spending categories?'",
       inputSchema: {
         type: "object",
         properties: {
           item_id: {
             type: "string",
-            description:
-              "Limit summary to a specific bank account. Omit for all accounts.",
+            description: "Limit to a specific bank/institution. Omit for all.",
+          },
+          account_id: {
+            type: "string",
+            description: "Limit to a specific account within a bank. Omit for all accounts.",
           },
           start_date: {
             type: "string",
@@ -447,13 +470,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "list_investment_holdings",
       description:
-        "List current investment holdings (positions) across connected brokerages: ticker, security name, quantity, and current value. Requires SheetLink MAX and a brokerage connected as an investment account.",
+        "List current investment holdings (positions) across brokerages as JSON with the full field set: ticker, security name, quantity, cost_basis, institution_price, institution_value, sector, industry, option details, and more. Requires SheetLink MAX and a brokerage connected as an investment account.",
       inputSchema: {
         type: "object",
         properties: {
           item_id: {
             type: "string",
             description: "Limit to a specific brokerage (item_id from list_accounts). Omit for all.",
+          },
+          account_id: {
+            type: "string",
+            description: "Limit to a specific investment account within a brokerage. Omit for all.",
           },
         },
         required: [],
@@ -462,13 +489,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "list_investment_activity",
       description:
-        "List investment activity (buys, sells, dividends, interest, fees) across brokerages, optionally filtered by date range. Requires SheetLink MAX and investment tracking enabled.",
+        "List investment activity (buys, sells, dividends, interest, fees) across brokerages as JSON with the full field set (type, subtype, quantity, price, amount, fees, ticker, security). Filter by brokerage, account, or date range. Requires SheetLink MAX.",
       inputSchema: {
         type: "object",
         properties: {
           item_id: {
             type: "string",
             description: "Limit to a specific brokerage. Omit for all.",
+          },
+          account_id: {
+            type: "string",
+            description: "Limit to a specific investment account within a brokerage. Omit for all.",
           },
           start_date: { type: "string", description: "Start date in YYYY-MM-DD format (inclusive)." },
           end_date: { type: "string", description: "End date in YYYY-MM-DD format (inclusive)." },
@@ -480,13 +511,17 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     {
       name: "get_portfolio_summary",
       description:
-        "Summarize the investment portfolio: total value and allocation grouped by sector (default) or individual security, with each group's percentage of the portfolio. Useful for 'what's my allocation?' or 'what are my largest positions?'. Requires SheetLink MAX.",
+        "Summarize the investment portfolio: total value and allocation grouped by sector (default) or individual security, with each group's percentage. Useful for 'what's my allocation?' or 'what are my largest positions?'. Requires SheetLink MAX.",
       inputSchema: {
         type: "object",
         properties: {
           item_id: {
             type: "string",
             description: "Limit to a specific brokerage. Omit for all.",
+          },
+          account_id: {
+            type: "string",
+            description: "Limit to a specific investment account within a brokerage. Omit for all.",
           },
           group_by: {
             type: "string",
